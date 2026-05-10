@@ -1,0 +1,6 @@
+{
+    "MAX_BATTERY_LEVEL": 85,
+    "MIN_BATTERY_LEVEL": 25,
+    "CHECK_INTERVAL_SECONDS": 180,
+    "AUDIO_ALERT_FILE": "/usr/share/sounds/freedesktop/stereo/complete.oga"
+}

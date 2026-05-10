@@ -1,199 +1,263 @@
 """
-Project: Battery Guard (Battery Health Monitor)
-Author: Mohamed Salem
-Date: May 2026
-Description: A robust background daemon for Linux Ubuntu that monitors battery health.
-             It alerts the user via critical desktop notifications and audio cues
-             when the battery reaches optimal charge limits, helping to prolong
-             battery lifespan. Features include dynamic hardware detection,
-             state management, and dual-channel logging.
+Project     : Battery Guard (Final Stable Edition)
+Author      : Mohamed Salem
+Date        : May 2026
+Version     : 2.1.0
+Description : Advanced Linux background daemon for battery health orchestration.
+              Features: Dynamic Polling, Emergency Hibernation, Wear Level Tracking,
+              Hot-Reload, and Root-to-User Notification Bridging.
 """
 
 import os
 import time
+import json
 import logging
+import logging.handlers
 import subprocess
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, Any
 
 # ==========================================
-# Global Constants & Configuration
+# System Constants & Pathing Strategy
 # ==========================================
-MAX_BATTERY_LEVEL = 85
-MIN_BATTERY_LEVEL = 25
-CHECK_INTERVAL_SECONDS = 300  # 300 seconds = 5 minutes
+# These files are managed in the same directory for portable testing
+CONFIG_FILE = "config.json"
 LOG_FILE = "battery_guard.log"
-AUDIO_ALERT_FILE = "/usr/share/sounds/freedesktop/stereo/complete.oga"
+BASE_SYSFS = "/sys/class/power_supply/"
 
 
-def setup_logging() -> None:
-    """
-    Configures a dual-channel logging system.
-    Logs are simultaneously written to a local file (for historical tracking)
-    and printed to the standard output/console (for real-time debugging).
-    """
-    log_format = "%(asctime)s [%(levelname)s] %(message)s"
-    date_format = "%Y-%m-%d %H:%M:%S"
+class BatteryGuard:
+    def __init__(self):
+        # Configuration and logging initialization
+        self.config = self._load_and_validate_config()
+        self.setup_logging()
 
-    formatter = logging.Formatter(fmt=log_format, datefmt=date_format)
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+        # State tracking and hardware discovery
+        self.last_notified_state = None
+        self.capacity_path, self.status_path, self.bat_base = self._discover_hardware()
 
-    # File Handler: Appends logs to the local log file
-    file_handler = logging.FileHandler(LOG_FILE)
-    file_handler.setFormatter(formatter)
+        # Identity bridge: Used to send alerts from Root to Desktop User
+        self.target_user = "mohamed-salem"
 
-    # Console Handler: Outputs logs to the terminal
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
+    def _load_and_validate_config(self) -> Dict[str, Any]:
+        """
+        Loads configuration from JSON. Validates threshold logic to ensure
+        the daemon doesn't enter an inconsistent state.
+        """
+        defaults = {
+            "MAX_BATTERY_LEVEL": 85,
+            "MIN_BATTERY_LEVEL": 25,
+            "EMERGENCY_LEVEL": 5,
+            "SAFE_POLLING_SECONDS": 300,
+            "CRITICAL_POLLING_SECONDS": 60,
+            "DYNAMIC_POLLING": True,
+            "HIBERNATE_ON_EMERGENCY": False,
+            "AUDIO_ALERT_FILE": "/usr/share/sounds/freedesktop/stereo/complete.oga"
+        }
 
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+        if not os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'w') as f:
+                    json.dump(defaults, f, indent=4)
+                return defaults
+            except Exception as e:
+                print(f"[ERROR] Failed to write config: {e}")
+                return defaults
+
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                data = json.load(f)
+
+            # Defensive logic: Ensure thresholds are sequential
+            if not (0 < data.get("EMERGENCY_LEVEL", 5) < data.get("MIN_BATTERY_LEVEL", 25) < data.get(
+                    "MAX_BATTERY_LEVEL", 85) <= 100):
+                logging.warning("Invalid configuration logic. Reverting to safe defaults.")
+                return defaults
+            return {**defaults, **data}
+        except Exception:
+            return defaults
+
+    def setup_logging(self):
+        """
+        Configures a professional rotating log system to prevent disk exhaustion.
+        Files are capped at 1MB with a single backup.
+        """
+        log_format = "%(asctime)s [%(levelname)s] %(message)s"
+        date_format = "%Y-%m-%d %H:%M:%S"
+        formatter = logging.Formatter(fmt=log_format, datefmt=date_format)
+
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+
+        if logger.hasHandlers():
+            logger.handlers.clear()
+
+        # File Handler with Rotation (1MB limit)
+        fh = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=1024 * 1024, backupCount=1)
+        fh.setFormatter(formatter)
+
+        # Console Handler for real-time monitoring
+        ch = logging.StreamHandler()
+        ch.setFormatter(formatter)
+
+        logger.addHandler(fh)
+        logger.addHandler(ch)
+
+    def _discover_hardware(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        Probes the sysfs tree to identify the battery hardware interface.
+        Supports standard Linux naming conventions (BAT0, BAT1, etc.).
+        """
+        try:
+            for item in os.listdir(BASE_SYSFS):
+                if item.startswith("BAT"):
+                    path = os.path.join(BASE_SYSFS, item)
+                    logging.info(f"Hardware Discovery: Monitoring active interface {item}")
+                    return os.path.join(path, "capacity"), os.path.join(path, "status"), path
+        except Exception as e:
+            logging.error(f"Hardware Discovery: Critical path failure - {e}")
+        return None, None, None
+
+    def get_wear_level(self) -> float:
+        """
+        Determines battery health status by comparing design capacity
+        with current full charge capability.
+        """
+        try:
+            current_f = "energy_full" if os.path.exists(os.path.join(self.bat_base, "energy_full")) else "charge_full"
+            design_f = "energy_full_design" if os.path.exists(
+                os.path.join(self.bat_base, "energy_full_design")) else "charge_full_design"
+
+            with open(os.path.join(self.bat_base, current_f), 'r') as f:
+                current = int(f.read().strip())
+            with open(os.path.join(self.bat_base, design_f), 'r') as f:
+                design = int(f.read().strip())
+
+            return round((current / design) * 100, 2)
+        except Exception:
+            return 0.0
+
+    def notify(self, title: str, msg: str, urgency: str = "critical"):
+        """
+        Final Professional Bridge: Executes alerts as the desktop user
+        while providing the necessary environment context for GUI/Audio.
+
+        Fix v2.1.1:
+        - Added PULSE_SERVER to correctly reach user's PulseAudio socket.
+        - Switched from 'sudo -u' to 'su -c' with explicit env vars inline
+          to avoid dbus-launch lookup failures inside sudo context.
+        """
+        try:
+            target_user = "mohamed-salem"
+            # Standard UID for the first user in Ubuntu is 1000
+            user_uid = "1000"
+
+            # Full environment needed for both GUI and Audio from a root process
+            env_prefix = (
+                f"DISPLAY=:0 "
+                f"XDG_RUNTIME_DIR=/run/user/{user_uid} "
+                f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{user_uid}/bus "
+                f"PULSE_SERVER=unix:/run/user/{user_uid}/pulse/native"
+            )
+
+            # 1. Dispatch Visual Notification via su -c (avoids dbus-launch lookup)
+            notify_cmd = f"{env_prefix} notify-send -u {urgency} '{title}' '{msg}'"
+            subprocess.run(
+                ['su', '-', target_user, '-c', notify_cmd],
+                check=False, capture_output=True
+            )
+
+            # 2. Dispatch Audio Alert with PulseAudio socket explicitly set
+            audio_cmd = f"{env_prefix} paplay {self.config['AUDIO_ALERT_FILE']}"
+            subprocess.run(
+                ['su', '-', target_user, '-c', audio_cmd],
+                check=False, capture_output=True
+            )
+
+        except Exception as e:
+            logging.debug(f"UX Bridge: Notification cycle failed - {e}")
+
+    def handle_emergency(self, capacity: int):
+        """
+        Implements Emergency Protection. Triggers hibernation if battery
+        hits the critical floor to prevent hardware damage.
+        """
+        if capacity <= self.config["EMERGENCY_LEVEL"]:
+            logging.critical(f"EMERGENCY: Battery at critical level {capacity}%.")
+            if self.config["HIBERNATE_ON_EMERGENCY"]:
+                self.notify("EMERGENCY", "System hibernating to protect hardware.")
+                time.sleep(5)
+                subprocess.run(['systemctl', 'hibernate'], check=False)
+
+    def calculate_polling_interval(self, capacity: int) -> int:
+        """
+        Dynamic Polling: Optimizes CPU usage by reducing check frequency
+        when battery is safe, and increasing it near thresholds.
+        """
+        if not self.config["DYNAMIC_POLLING"]:
+            return self.config["SAFE_POLLING_SECONDS"]
+
+        # High-frequency polling (Critical Zones)
+        near_max = abs(capacity - self.config["MAX_BATTERY_LEVEL"]) <= 5
+        near_min = abs(capacity - self.config["MIN_BATTERY_LEVEL"]) <= 5
+
+        if near_max or near_min or capacity < self.config["MIN_BATTERY_LEVEL"]:
+            return self.config["CRITICAL_POLLING_SECONDS"]
+
+        # Low-frequency polling (Safe Zone)
+        return self.config["SAFE_POLLING_SECONDS"]
+
+    def run(self):
+        """
+        The main daemon lifecycle.
+        """
+        if not self.capacity_path:
+            logging.critical("Daemon Exit: Hardware detection failed.")
+            return
+
+        # Startup handshake
+        health = self.get_wear_level()
+        self.notify("Battery Guard Active",
+                    f"Monitoring {health}% Health Battery.\nTarget: {self.config['MIN_BATTERY_LEVEL']}% - {self.config['MAX_BATTERY_LEVEL']}%")
+
+        logging.info(f"Daemon: Initialization successful. Battery Health: {health}%")
+
+        while True:
+            try:
+                # Support Hot-Reload by reloading config each cycle
+                self.config = self._load_and_validate_config()
+
+                with open(self.capacity_path, 'r') as f:
+                    cap = int(f.read().strip())
+                with open(self.status_path, 'r') as f:
+                    stat = f.read().strip()
+
+                logging.info(f"Telemetry: {cap}% | {stat} | Health: {health}%")
+
+                # State Machine Logic
+                if cap >= self.config["MAX_BATTERY_LEVEL"] and stat == "Charging":
+                    if self.last_notified_state != "FULL":
+                        self.notify("Battery Guard: Limit Reached", f"Battery is at {cap}%. Please unplug.")
+                        self.last_notified_state = "FULL"
+
+                elif cap <= self.config["MIN_BATTERY_LEVEL"] and stat == "Discharging":
+                    if self.last_notified_state != "LOW":
+                        self.notify("Battery Guard: Low Battery", f"Battery is at {cap}%. Please charge.")
+                        self.last_notified_state = "LOW"
+                    self.handle_emergency(cap)
+
+                else:
+                    self.last_notified_state = None
+
+                time.sleep(self.calculate_polling_interval(cap))
+
+            except KeyboardInterrupt:
+                logging.info("Daemon: User termination received.")
+                break
+            except Exception as e:
+                logging.error(f"Daemon: Operational error - {e}")
+                time.sleep(60)
 
 
-def get_battery_paths() -> Tuple[Optional[str], Optional[str]]:
-    """
-    Dynamically scans the Linux sysfs (System File System) to locate the active battery.
-    This ensures cross-device compatibility (e.g., handling BAT0, BAT1, etc.).
-
-    Returns:
-        Tuple containing the path to the capacity file and the status file.
-    """
-    base_dir = "/sys/class/power_supply/"
-
-    try:
-        # Iterate over all directories in the power_supply path
-        for item in os.listdir(base_dir):
-            if item.startswith("BAT"):
-                capacity_path = os.path.join(base_dir, item, "capacity")
-                status_path = os.path.join(base_dir, item, "status")
-
-                logging.info(f"Battery interface dynamically detected at: {item}")
-                return capacity_path, status_path
-
-        logging.error("Hardware detection failed: No battery directory found.")
-        return None, None
-
-    except FileNotFoundError:
-        logging.error(f"System path not found: {base_dir}. Is this a standard Linux system?")
-        return None, None
-
-
-def get_battery_info(capacity_path: str, status_path: str) -> Tuple[Optional[int], Optional[str]]:
-    """
-    Reads the real-time battery capacity percentage and charging state.
-    Includes runtime validation to prevent crashes if the battery is suddenly disconnected.
-    """
-    # Defensive programming: Verify paths still exist before attempting file I/O
-    if not os.path.exists(capacity_path):
-        logging.warning("Battery path is temporarily inaccessible. Skipping this cycle.")
-        return None, None
-
-    try:
-        # Read capacity percentage
-        with open(capacity_path, "r") as capacity_file:
-            capacity = int(capacity_file.read().strip())
-
-        # Read status (Charging / Discharging / Full)
-        with open(status_path, "r") as status_file:
-            status = status_file.read().strip()
-
-        return capacity, status
-
-    except Exception as e:
-        logging.error(f"I/O Error while reading battery metrics: {e}")
-        return None, None
-
-
-def send_notification(title: str, message: str) -> None:
-    """
-    Dispatches a critical desktop notification and plays a system sound.
-    Uses 'check=False' to gracefully handle environments lacking audio/notification tools.
-    """
-    try:
-        # Dispatch visual alert (-u critical prevents auto-dismissal)
-        subprocess.run(['notify-send', '-u', 'critical', title, message], check=False)
-
-        # Dispatch audio alert (using the selected 'complete' tone)
-        subprocess.run(['paplay', AUDIO_ALERT_FILE], check=False)
-
-    except Exception as e:
-        logging.warning(f"Failed to execute external notification commands: {e}")
-
-
-def monitor_battery() -> None:
-    """
-    The primary daemon loop. Periodically evaluates battery health metrics against
-    defined thresholds and triggers actions accordingly. Manages notification state
-    to prevent spamming the user.
-    """
-    setup_logging()
-
-    logging.info("=" * 60)
-    logging.info("Battery Guard Daemon Initialized.")
-    logging.info(f"Target Thresholds  -> Max: {MAX_BATTERY_LEVEL}% | Min: {MIN_BATTERY_LEVEL}%")
-    logging.info(f"Polling Frequency  -> Every {CHECK_INTERVAL_SECONDS} seconds")
-    logging.info("=" * 60)
-
-    # Perform initial hardware discovery
-    capacity_path, status_path = get_battery_paths()
-
-    # Graceful exit if hardware is unsupported
-    if capacity_path is None or status_path is None:
-        print(f"\n[CRITICAL] Initialization failed. Please review '{LOG_FILE}'. Exiting.\n")
-        return
-
-    # State variable to remember the last triggered alert
-    last_notified_state = None
-
-    # Infinite daemon loop
-    while True:
-        capacity, status = get_battery_info(capacity_path, status_path)
-
-        if capacity is not None and status is not None:
-            logging.info(f"Telemetry -> Battery: {capacity}% | State: {status}")
-
-            # -------------------------------------------------------------
-            # Logical Branch 1: Overcharge Protection (High Limit Reached)
-            # -------------------------------------------------------------
-            if capacity >= MAX_BATTERY_LEVEL and status == "Charging":
-                # Only notify if we haven't already sent the 'FULL' alert
-                if last_notified_state != "FULL":
-                    send_notification(
-                        "Battery Guard: High Limit",
-                        f"Battery level is {capacity}%. Please unplug the AC adapter."
-                    )
-                    last_notified_state = "FULL"
-                    logging.warning(f"ACTION: Alert Dispatched [Type: HIGH_LIMIT, Level: {capacity}%]")
-
-            # -------------------------------------------------------------
-            # Logical Branch 2: Deep Discharge Protection (Low Limit Reached)
-            # -------------------------------------------------------------
-            elif capacity <= MIN_BATTERY_LEVEL and status == "Discharging":
-                # Only notify if we haven't already sent the 'LOW' alert
-                if last_notified_state != "LOW":
-                    send_notification(
-                        "Battery Guard: Low Limit",
-                        f"Battery level is {capacity}%. Please plug in the AC adapter."
-                    )
-                    last_notified_state = "LOW"
-                    logging.warning(f"ACTION: Alert Dispatched [Type: LOW_LIMIT, Level: {capacity}%]")
-
-            # -------------------------------------------------------------
-            # Logical Branch 3: Safe Zone or Action Taken (State Reset)
-            # -------------------------------------------------------------
-            else:
-                # If battery is within safe margins, or the user has complied
-                # (e.g., unplugged the charger), we reset the state to allow future alerts.
-                last_notified_state = None
-
-        # Suspend thread execution to conserve CPU cycles and RAM
-        time.sleep(CHECK_INTERVAL_SECONDS)
-
-
-# Standard Python boilerplate to execute the main function
 if __name__ == "__main__":
-    # Ensure graceful handling if the user manually stops the script (Ctrl+C)
-    try:
-        monitor_battery()
-    except KeyboardInterrupt:
-        print("\n[INFO] Battery Guard stopped by user. Goodbye!")
+    guard = BatteryGuard()
+    guard.run()
